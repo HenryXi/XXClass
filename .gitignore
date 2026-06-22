@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Gradle / Android build outputs
+.gradle/
+.gradle-home/
+build/
+**/build/
+captures/
+
+# Local SDK path / machine-specific config
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Android signing / secrets
+*.jks
+*.keystore
+keystore.properties
+
+# Logs
+*.log
