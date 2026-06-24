@@ -24,11 +24,13 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelUuid
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.classroomble.R
 import com.example.classroomble.model.AckMessage
 import com.example.classroomble.model.JsonCodec
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 
 class ReceiverBleService : Service() {
@@ -38,22 +40,28 @@ class ReceiverBleService : Service() {
     private var gattServer: BluetoothGattServer? = null
     private var ackCharacteristic: BluetoothGattCharacteristic? = null
     private var subscribedDevice: BluetoothDevice? = null
+    private var advertiseWithDeviceName = true
+    private var retriedWithoutDeviceName = false
 
     private val recentMsgIds = ConcurrentHashMap<String, Long>()
+    private val incomingBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
 
     override fun onCreate() {
         super.onCreate()
+        Log.i(TAG, "onCreate receiver service")
         startForeground(NOTIFICATION_ID, buildNotification("接收模式运行中"))
         setupBle()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.i(TAG, "onStartCommand flags=$flags startId=$startId")
         AppState.setStatus("接收模式已启动")
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.i(TAG, "onDestroy receiver service")
         stopAdvertising()
         gattServer?.close()
         gattServer = null
@@ -65,6 +73,7 @@ class ReceiverBleService : Service() {
     private fun setupBle() {
         bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager?.adapter
+        Log.d(TAG, "setupBle btEnabled=${bluetoothAdapter?.isEnabled}")
         if (bluetoothAdapter?.isEnabled != true) {
             AppState.setStatus("蓝牙未开启")
             stopSelf()
@@ -73,6 +82,7 @@ class ReceiverBleService : Service() {
 
         advertiser = bluetoothAdapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
+            Log.e(TAG, "bluetoothLeAdvertiser is null")
             AppState.setStatus("设备不支持BLE广播")
             stopSelf()
             return
@@ -84,6 +94,7 @@ class ReceiverBleService : Service() {
 
     private fun setupGattServer() {
         gattServer = bluetoothManager?.openGattServer(this, gattServerCallback)
+        Log.d(TAG, "openGattServer result=${gattServer != null}")
         val service = BluetoothGattService(BleConstants.SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
 
         val writeCharacteristic = BluetoothGattCharacteristic(
@@ -105,15 +116,18 @@ class ReceiverBleService : Service() {
 
         service.addCharacteristic(writeCharacteristic)
         ackCharacteristic?.let(service::addCharacteristic)
-        gattServer?.addService(service)
+        val added = gattServer?.addService(service) ?: false
+        Log.d(TAG, "addService result=$added")
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            Log.d(TAG, "onConnectionStateChange addr=${device.address} status=$status newState=$newState")
             if (newState == BluetoothGatt.STATE_CONNECTED) {
                 subscribedDevice = device
                 AppState.setStatus("已连接: ${device.address}")
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                incomingBuffers.remove(device.address)
                 if (device.address == subscribedDevice?.address) {
                     subscribedDevice = null
                 }
@@ -130,6 +144,10 @@ class ReceiverBleService : Service() {
             offset: Int,
             value: ByteArray,
         ) {
+            Log.d(
+                TAG,
+                "onCharacteristicWriteRequest addr=${device.address} requestId=$requestId prepared=$preparedWrite responseNeeded=$responseNeeded offset=$offset bytes=${value.size}",
+            )
             if (characteristic.uuid != BleConstants.WRITE_UUID) {
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, 0, null)
@@ -137,13 +155,33 @@ class ReceiverBleService : Service() {
                 return
             }
 
-            val msg = JsonCodec.decodeMessage(value)
+            val key = device.address ?: "unknown"
+            val buffer = incomingBuffers.getOrPut(key) { ByteArrayOutputStream() }
+            if (offset == 0 && !preparedWrite && buffer.size() > 0) {
+                buffer.reset()
+            }
+            if (offset > 0 && offset < buffer.size()) {
+                // Device retried/rewound, reset to avoid mixing different frames.
+                buffer.reset()
+            }
+            buffer.write(value)
+
+            val merged = buffer.toByteArray()
+            val msg = JsonCodec.decodeMessage(merged)
             if (msg == null) {
+                Log.w(TAG, "decodeMessage failed, buffered=${merged.size}")
+                if (merged.size > MAX_BUFFER_BYTES) {
+                    Log.w(TAG, "buffer overflow, reset")
+                    buffer.reset()
+                }
                 if (responseNeeded) {
-                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH, 0, null)
+                    // Allow peer to continue sending remaining chunks.
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                 }
                 return
             }
+            buffer.reset()
+            Log.i(TAG, "recv msgId=${msg.msgId.takeLast(6)} textLen=${msg.text.length}")
 
             cleanupOldIds()
             val alreadySeen = recentMsgIds.putIfAbsent(msg.msgId, System.currentTimeMillis()) != null
@@ -153,7 +191,8 @@ class ReceiverBleService : Service() {
 
             val ackBytes = JsonCodec.encodeAck(AckMessage(msg.msgId, ok = true, code = 0))
             ackCharacteristic?.value = ackBytes
-            gattServer?.notifyCharacteristicChanged(device, ackCharacteristic, false)
+            val notified = gattServer?.notifyCharacteristicChanged(device, ackCharacteristic, false) ?: false
+            Log.d(TAG, "notifyCharacteristicChanged result=$notified")
 
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
@@ -169,6 +208,10 @@ class ReceiverBleService : Service() {
             offset: Int,
             value: ByteArray,
         ) {
+            Log.d(
+                TAG,
+                "onDescriptorWriteRequest addr=${device.address} requestId=$requestId uuid=${descriptor.uuid} bytes=${value.size} responseNeeded=$responseNeeded",
+            )
             if (descriptor.uuid == BleConstants.CCCD_UUID) {
                 descriptor.value = value
                 if (responseNeeded) {
@@ -188,19 +231,32 @@ class ReceiverBleService : Service() {
             stopSelf()
             return
         }
+        startAdvertisingInternal()
+    }
+
+    private fun startAdvertisingInternal() {
+        stopAdvertising()
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_LOW)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(ParcelUuid(BleConstants.SERVICE_UUID))
             .build()
-
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        if (advertiseWithDeviceName) {
+            val scanResponse = AdvertiseData.Builder()
+                .setIncludeDeviceName(true)
+                .build()
+            Log.d(TAG, "startAdvertising includeDeviceName=true")
+            advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        } else {
+            Log.d(TAG, "startAdvertising includeDeviceName=false")
+            advertiser?.startAdvertising(settings, data, advertiseCallback)
+        }
     }
 
     private fun stopAdvertising() {
@@ -209,10 +265,23 @@ class ReceiverBleService : Service() {
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            Log.i(TAG, "advertise start success mode=${settingsInEffect.mode} tx=${settingsInEffect.txPowerLevel}")
             AppState.setStatus("等待连接")
         }
 
         override fun onStartFailure(errorCode: Int) {
+            Log.e(TAG, "advertise start failure errorCode=$errorCode")
+            if (
+                errorCode == AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE &&
+                advertiseWithDeviceName &&
+                !retriedWithoutDeviceName
+            ) {
+                retriedWithoutDeviceName = true
+                advertiseWithDeviceName = false
+                AppState.setStatus("设备名过长，切换兼容广播")
+                startAdvertisingInternal()
+                return
+            }
             AppState.setStatus("广播失败: $errorCode")
         }
     }
@@ -248,6 +317,8 @@ class ReceiverBleService : Service() {
     }
 
     companion object {
+        private const val TAG = "ReceiverBleService"
+        private const val MAX_BUFFER_BYTES = 1024
         private const val CHANNEL_ID = "receiver_ble_channel"
         private const val NOTIFICATION_ID = 1001
     }

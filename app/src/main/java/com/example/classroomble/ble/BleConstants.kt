@@ -5,6 +5,7 @@ import java.util.UUID
 object BleConstants {
     const val PREFS = "ble_prefs"
     const val KEY_BOUND_DEVICE = "bound_device"
+    const val KEY_BOUND_DEVICE_NAME = "bound_device_name"
     const val MAX_TEXT_LEN = 16
     const val SERVICE_NAME = "ClassroomText"
 

@@ -2,17 +2,13 @@ package com.example.classroomble
 
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
-import android.widget.ArrayAdapter
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import com.example.classroomble.ble.AppState
-import com.example.classroomble.ble.BleConstants
 import com.example.classroomble.ble.ReceiverBleService
 import com.example.classroomble.ble.SenderBleManager
 import com.example.classroomble.databinding.ActivityMainBinding
@@ -23,13 +19,20 @@ import kotlinx.coroutines.launch
 class MainActivity : AppCompatActivity(), SenderBleManager.Listener {
     private lateinit var binding: ActivityMainBinding
     private lateinit var senderManager: SenderBleManager
-
-    private val bindCandidates = mutableListOf<android.bluetooth.BluetoothDevice>()
+    private var isReceiverMode: Boolean = true
+    private val warmUpRunnable = Runnable {
+        if (!isReceiverMode) {
+            senderManager.warmUpSenderConnection()
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) {
         updateStatus("权限结果已更新")
+        if (!isReceiverMode && hasAllPermissions()) {
+            scheduleSenderWarmUp()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,32 +45,18 @@ class MainActivity : AppCompatActivity(), SenderBleManager.Listener {
         setupUi()
         observeState()
 
-        val defaultReceiver = resources.configuration.smallestScreenWidthDp >= 600
-        if (defaultReceiver) {
-            binding.modeToggle.check(R.id.btnReceiverMode)
-            switchMode(isReceiver = true)
-        } else {
-            binding.modeToggle.check(R.id.btnSenderMode)
-            switchMode(isReceiver = false)
-        }
+        isReceiverMode = savedInstanceState?.getBoolean(KEY_IS_RECEIVER_MODE) ?: true
+        binding.modeToggle.check(if (isReceiverMode) R.id.btnReceiverMode else R.id.btnSenderMode)
+        switchMode(isReceiver = isReceiverMode)
     }
 
     private fun setupUi() {
         binding.modeToggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
-            switchMode(isReceiver = checkedId == R.id.btnReceiverMode)
-        }
-
-        binding.btnBind.setOnClickListener {
-            if (!ensurePermissions()) return@setOnClickListener
-            bindCandidates.clear()
-            senderManager.startBindScan()
-            binding.root.postDelayed({ showBindDialog() }, 8_200L)
-        }
-
-        binding.btnClearBind.setOnClickListener {
-            senderManager.clearBoundDevice()
-            updateStatus("已清除绑定")
+            val targetReceiver = checkedId == R.id.btnReceiverMode
+            if (targetReceiver == isReceiverMode) return@addOnButtonCheckedListener
+            isReceiverMode = targetReceiver
+            switchMode(isReceiver = targetReceiver)
         }
 
         binding.btnSend.setOnClickListener {
@@ -89,18 +78,30 @@ class MainActivity : AppCompatActivity(), SenderBleManager.Listener {
         binding.receiverPanel.isVisible = isReceiver
 
         if (isReceiver) {
+            binding.root.removeCallbacks(warmUpRunnable)
+            binding.textDisplay.rotation = 90f
             startReceiverService()
             updateStatus("接收模式运行中")
         } else {
+            binding.textDisplay.rotation = 0f
             stopReceiverService()
-            updateStatus("发送模式")
+            updateStatus("发送模式，准备自动连接...")
+            if (ensurePermissions()) {
+                scheduleSenderWarmUp()
+            }
         }
+    }
+
+    private fun scheduleSenderWarmUp() {
+        binding.root.removeCallbacks(warmUpRunnable)
+        binding.root.postDelayed(warmUpRunnable, 300L)
+        binding.root.postDelayed(warmUpRunnable, 1_200L)
     }
 
     private fun observeState() {
         lifecycleScope.launch {
             AppState.receivedText.collect {
-                binding.textDisplay.text = it
+                binding.textDisplay.text = it.replace('\n', ' ')
             }
         }
 
@@ -113,44 +114,30 @@ class MainActivity : AppCompatActivity(), SenderBleManager.Listener {
 
     private fun startReceiverService() {
         val intent = Intent(this, ReceiverBleService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            ContextCompat.startForegroundService(this, intent)
-        } else {
-            startService(intent)
-        }
+        // We are in foreground Activity; using startService avoids foreground-service
+        // timeout race when rapidly switching modes/orientation.
+        startService(intent)
     }
 
     private fun stopReceiverService() {
         stopService(Intent(this, ReceiverBleService::class.java))
     }
 
-    private fun showBindDialog() {
-        senderManager.stopBindScan()
-        if (bindCandidates.isEmpty()) {
-            updateStatus("未扫描到平板，请确认平板处于接收模式")
-            return
-        }
-
-        val names = bindCandidates.map { "${it.name ?: "未知设备"} (${it.address})" }
-        AlertDialog.Builder(this)
-            .setTitle("选择学生平板")
-            .setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, names)) { _, which ->
-                senderManager.bindToDevice(bindCandidates[which])
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
     private fun ensurePermissions(): Boolean {
+        if (hasAllPermissions()) return true
         val permissions = PermissionHelper.requiredPermissions()
         val denied = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (denied.isNotEmpty()) {
-            permissionLauncher.launch(denied.toTypedArray())
-            return false
+        permissionLauncher.launch(denied.toTypedArray())
+        return false
+    }
+
+    private fun hasAllPermissions(): Boolean {
+        val permissions = PermissionHelper.requiredPermissions()
+        return permissions.all { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
         }
-        return true
     }
 
     private fun updateStatus(value: String) {
@@ -161,10 +148,12 @@ class MainActivity : AppCompatActivity(), SenderBleManager.Listener {
         runOnUiThread { updateStatus(status) }
     }
 
-    override fun onBindDevices(devices: List<android.bluetooth.BluetoothDevice>) {
-        bindCandidates.clear()
-        bindCandidates.addAll(devices)
-        updateStatus("扫描到${devices.size}个设备")
+    override fun onBindDevices(devices: List<SenderBleManager.BindCandidate>) {
+        if (devices.isNotEmpty()) {
+            updateStatus("发现设备: ${devices.first().displayName}")
+        } else {
+            updateStatus("扫描到0个设备")
+        }
     }
 
     override fun onSendResult(success: Boolean, message: String) {
@@ -178,7 +167,17 @@ class MainActivity : AppCompatActivity(), SenderBleManager.Listener {
     }
 
     override fun onDestroy() {
+        binding.root.removeCallbacks(warmUpRunnable)
         senderManager.release()
         super.onDestroy()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_IS_RECEIVER_MODE, isReceiverMode)
+    }
+
+    companion object {
+        private const val KEY_IS_RECEIVER_MODE = "key_is_receiver_mode"
     }
 }

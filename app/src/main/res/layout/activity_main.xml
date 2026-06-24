@@ -55,22 +55,6 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:text="发送" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnBind"
-            style="@style/Widget.Material3.Button.OutlinedButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="首次扫描并绑定平板" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnClearBind"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="清除绑定" />
     </LinearLayout>
 
     <FrameLayout
@@ -86,11 +70,16 @@
             android:id="@+id/textDisplay"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
+            android:fontFamily="楷体_GB2312"
             android:gravity="center"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:scrollHorizontally="true"
             android:padding="20dp"
             android:text="待接收"
             android:textColor="#111111"
             android:textSize="220sp"
+            android:textStyle="normal"
             android:autoSizeTextType="uniform"
             android:autoSizeMinTextSize="36sp"
             android:autoSizeMaxTextSize="240sp"
