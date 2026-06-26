@@ -3,16 +3,12 @@ package com.example.classroomble.ble
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -21,6 +17,11 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.classroomble.model.ClassroomMessage
 import com.example.classroomble.model.JsonCodec
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.IOException
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.util.UUID
 
 class SenderBleManager(
@@ -36,6 +37,7 @@ class SenderBleManager(
     interface Listener {
         fun onStatus(status: String)
         fun onBindDevices(devices: List<BindCandidate>)
+        fun onNeedSelectDevice(devices: List<BindCandidate>)
         fun onSendResult(success: Boolean, message: String)
     }
 
@@ -44,44 +46,72 @@ class SenderBleManager(
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
-    private val scanner: BluetoothLeScanner?
-        get() = adapter?.bluetoothLeScanner
 
     private var bindScanResults = linkedMapOf<String, BindCandidate>()
-    private var isBindScanning = false
-    private var connectScanResults = linkedMapOf<String, BindCandidate>()
+    private var isDiscoveryRunning = false
+    private var isConnecting = false
+    private var receiverRegistered = false
 
-    private var autoScanCallback: ScanCallback? = null
-    private var bindScanCallback: ScanCallback? = null
-    private var gatt: BluetoothGatt? = null
-    private var ackCharacteristic: BluetoothGattCharacteristic? = null
-    private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var socket: BluetoothSocket? = null
+    private var reader: BufferedReader? = null
+    private var writer: BufferedWriter? = null
+    private var readThread: Thread? = null
+    private val ioLock = Any()
+
     private var pendingMsgId: String? = null
     private var pendingPayload: ByteArray? = null
     private var retriesLeft = 0
-    private var isConnecting = false
     private var currentAttempt = 0
-    private var servicesDiscoveryStarted = false
-    private var directFallbackAddress: String? = null
-    private var directFallbackName: String? = null
-    private val mtuFallbackRunnable = Runnable {
-        val g = gatt ?: return@Runnable
-        maybeDiscoverServices(g, "mtu-timeout")
+
+    private var discoveryPurpose: DiscoveryPurpose = DiscoveryPurpose.NONE
+    private var awaitingUserSelection = false
+
+    private enum class DiscoveryPurpose {
+        NONE,
+        AUTO_BIND_AND_SEND,
+        AUTO_BIND_WARMUP,
     }
-    private val directConnectFallbackRunnable = Runnable {
-        val address = directFallbackAddress ?: return@Runnable
-        val name = directFallbackName.orEmpty()
-        if (pendingPayload == null) return@Runnable
-        if (autoScanCallback != null) return@Runnable
-        if (writeCharacteristic != null || servicesDiscoveryStarted) return@Runnable
-        Log.w(TAG, "direct connect fallback -> scan addr=$address")
-        scanAndConnect(address, name)
+
+    private val ackTimeoutRunnable = Runnable {
+        onAttemptFailed("等待回执超时")
     }
+
     private val idleDisconnectRunnable = Runnable {
-        if (pendingPayload != null || isConnecting || autoScanCallback != null) return@Runnable
-        Log.d(TAG, "idle timeout disconnect")
-        disconnectGatt()
+        if (pendingPayload != null || isConnecting || isDiscoveryRunning) return@Runnable
+        disconnectSocket()
         listener.onStatus("连接空闲已断开")
+    }
+
+    private val discoveryTimeoutRunnable = Runnable {
+        if (!isDiscoveryRunning) return@Runnable
+        stopDiscoveryInternal(emitStatus = false)
+        handleDiscoveryCompleted()
+    }
+
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+                    val address = device.address ?: return
+                    val name = resolveDisplayName(device)
+                    val candidate = BindCandidate(device, address, name)
+                    bindScanResults[address] = candidate
+                    listener.onBindDevices(bindScanResults.values.toList())
+                }
+
+                BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                    if (!isDiscoveryRunning) return
+                    handler.removeCallbacks(discoveryTimeoutRunnable)
+                    stopDiscoveryInternal(emitStatus = false)
+                    handleDiscoveryCompleted()
+                }
+            }
+        }
+    }
+
+    init {
+        registerReceiverIfNeeded()
     }
 
     fun hasBoundDevice(): Boolean = getBoundAddress().isNotBlank()
@@ -98,58 +128,36 @@ class SenderBleManager(
             listener.onStatus("缺少蓝牙权限")
             return
         }
-        if (isBindScanning) return
-
-        val scanner = scanner ?: run {
-            listener.onStatus("蓝牙不可用")
+        if (adapter?.isEnabled != true) {
+            listener.onStatus("请先开启蓝牙")
             return
         }
-
-        bindScanResults.clear()
-        isBindScanning = true
-        listener.onStatus("扫描中...")
-
-        bindScanCallback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val device = result.device ?: return
-                val key = device.address ?: return
-                if (!isTargetService(result)) return
-
-                val resolvedName = resolveDisplayName(device, result)
-                val old = bindScanResults[key]
-                val merged = if (old == null) {
-                    BindCandidate(device, key, resolvedName)
-                } else {
-                    val bestName = when {
-                        old.displayName != UNKNOWN_NAME -> old.displayName
-                        resolvedName != UNKNOWN_NAME -> resolvedName
-                        else -> old.displayName
-                    }
-                    BindCandidate(device, key, bestName)
-                }
-                bindScanResults[key] = merged
-                listener.onBindDevices(bindScanResults.values.toList())
-            }
-        }
-
-        // Some OEM stacks are flaky when scanning with only Service UUID filters.
-        // Use broad scan here and then do service-UUID filtering in callback.
-        scanner.startScan(emptyList(), defaultScanSettings(), bindScanCallback)
-        handler.postDelayed({ stopBindScan() }, BIND_SCAN_TIMEOUT_MS)
+        startDiscovery(DiscoveryPurpose.NONE, "扫描中...")
     }
 
     fun stopBindScan() {
-        if (!isBindScanning) return
-        isBindScanning = false
-        bindScanCallback?.let { scanner?.stopScan(it) }
-        bindScanCallback = null
-        listener.onStatus("扫描结束")
+        discoveryPurpose = DiscoveryPurpose.NONE
+        stopDiscoveryInternal(emitStatus = true)
     }
 
     fun bindToDevice(candidate: BindCandidate) {
         stopBindScan()
+        awaitingUserSelection = false
         saveBoundDevice(candidate.address, candidate.displayName)
-        listener.onStatus("已绑定: ${candidate.displayName}")
+        listener.onStatus("已选择: ${candidate.displayName}，正在连接")
+        if (pendingPayload != null || !isSocketAlive()) {
+            connectAndMaybeSend(candidate.device)
+        }
+    }
+
+    fun cancelDeviceSelection() {
+        if (!awaitingUserSelection) return
+        awaitingUserSelection = false
+        if (pendingPayload != null) {
+            failCurrentSend("未选择学生平板，发送已取消")
+        } else {
+            listener.onStatus("已取消设备选择")
+        }
     }
 
     fun sendText(text: String) {
@@ -163,31 +171,49 @@ class SenderBleManager(
         }
 
         val msgId = UUID.randomUUID().toString()
-        val payload = JsonCodec.encodeMessage(
+        pendingMsgId = msgId
+        pendingPayload = JsonCodec.encodeMessage(
             ClassroomMessage(
                 msgId = msgId,
                 ts = System.currentTimeMillis(),
                 text = text,
             ),
         )
-
-        pendingMsgId = msgId
-        pendingPayload = payload
         retriesLeft = MAX_RETRY
         currentAttempt = 0
         handler.removeCallbacks(idleDisconnectRunnable)
+
+        if (trySendOnExistingConnection()) {
+            return
+        }
+
+        val boundAddress = getBoundAddress()
         listener.onStatus("正在连接学生平板...")
-        val bound = getBoundAddress()
-        Log.i(TAG, "sendText start msgId=${msgId.takeLast(6)} textLen=${text.length} boundAddr=$bound boundName=${getBoundName()}")
-        if (trySendOnExistingConnection(payload)) {
-            return
-        }
-        if (bound.isBlank()) {
+        if (boundAddress.isBlank() || !isBoundTargetLikelyReceiver()) {
+            if (boundAddress.isNotBlank()) {
+                clearBoundDevice()
+                listener.onStatus("检测到旧绑定，自动重新发现平板...")
+            }
+            val taggedBonded = collectBondedCandidates().filter { isLikelyReceiverDevice(it.displayName) }
+            if (taggedBonded.size == 1) {
+                val candidate = taggedBonded.first()
+                saveBoundDevice(candidate.address, candidate.displayName)
+                listener.onStatus("已从已配对设备匹配: ${candidate.displayName}，正在连接")
+                connectAndMaybeSend(candidate.device)
+                return
+            }
+            if (taggedBonded.size > 1) {
+                listener.onStatus("发现多个已配对学生平板，请选择")
+                awaitingUserSelection = true
+                listener.onNeedSelectDevice(taggedBonded)
+                return
+            }
             listener.onStatus("首次发送，自动发现并绑定中...")
-            scanForAutoBindAndConnect(triggeredBySend = true)
+            startDiscovery(DiscoveryPurpose.AUTO_BIND_AND_SEND, "扫描中...")
             return
         }
-        connectWithFallback(bound, getBoundName(), preferDirect = true)
+
+        connectToBoundAddress(boundAddress)
     }
 
     fun warmUpSenderConnection() {
@@ -199,396 +225,352 @@ class SenderBleManager(
             listener.onStatus("蓝牙未开启，暂不预连接")
             return
         }
-        if (pendingPayload != null || isConnecting || autoScanCallback != null) return
-        if (gatt != null && writeCharacteristic != null && ackCharacteristic != null) return
+        if (pendingPayload != null || isConnecting || isDiscoveryRunning) return
+        if (isSocketAlive()) return
 
-        val bound = getBoundAddress()
-        if (bound.isBlank()) {
-            listener.onStatus("未绑定，后台自动发现设备...")
-            scanForAutoBindAndConnect(triggeredBySend = false)
-            return
-        }
-        listener.onStatus("后台预连接中...")
-        connectWithFallback(bound, getBoundName(), preferDirect = true)
-    }
-
-    private fun trySendOnExistingConnection(payload: ByteArray): Boolean {
-        val g = gatt ?: return false
-        if (writeCharacteristic == null || ackCharacteristic == null) return false
-        listener.onStatus("复用连接发送中...")
-        Log.d(TAG, "reuse active gatt for send payloadBytes=${payload.size}")
-        return sendPayload(g, payload)
-    }
-
-    private fun connectWithFallback(targetAddress: String, targetName: String, preferDirect: Boolean) {
-        if (preferDirect && tryDirectConnect(targetAddress, targetName)) {
-            return
-        }
-        scanAndConnect(targetAddress, targetName)
-    }
-
-    private fun tryDirectConnect(targetAddress: String, targetName: String): Boolean {
-        val device = try {
-            adapter?.getRemoteDevice(targetAddress)
-        } catch (_: IllegalArgumentException) {
-            null
-        }
-        if (device == null) return false
-
-        directFallbackAddress = targetAddress
-        directFallbackName = targetName
-        handler.removeCallbacks(directConnectFallbackRunnable)
-        listener.onStatus("已绑定设备，快速连接中...")
-        Log.d(TAG, "tryDirectConnect addr=$targetAddress")
-        disconnectGatt()
-        connectGattWithDelay(device)
-        handler.postDelayed(directConnectFallbackRunnable, DIRECT_CONNECT_FALLBACK_MS)
-        return true
-    }
-
-    private fun scanForAutoBindAndConnect(triggeredBySend: Boolean) {
-        handler.removeCallbacks(directConnectFallbackRunnable)
-        directFallbackAddress = null
-        directFallbackName = null
-        disconnectGatt()
-
-        val scanner = scanner ?: run {
-            if (triggeredBySend) {
-                failCurrentSend("蓝牙扫描不可用")
-            } else {
-                listener.onStatus("蓝牙扫描不可用")
+        val boundAddress = getBoundAddress()
+        if (boundAddress.isBlank() || !isBoundTargetLikelyReceiver()) {
+            if (boundAddress.isNotBlank()) {
+                clearBoundDevice()
+                listener.onStatus("检测到旧绑定，后台自动重新发现设备...")
             }
-            return
-        }
-
-        autoScanCallback?.let { scanner.stopScan(it) }
-        connectScanResults.clear()
-
-        val callback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val device = result.device ?: return
-                if (!isTargetService(result)) return
-
-                val address = device.address ?: return
-                val displayName = resolveDisplayName(device, result)
-                val candidate = BindCandidate(device, address, displayName)
-                connectScanResults[address] = candidate
-
-                scanner.stopScan(this)
-                autoScanCallback = null
+            val taggedBonded = collectBondedCandidates().filter { isLikelyReceiverDevice(it.displayName) }
+            if (taggedBonded.isNotEmpty()) {
+                val candidate = taggedBonded.first()
                 saveBoundDevice(candidate.address, candidate.displayName)
-                listener.onStatus("已自动绑定: ${candidate.displayName}，正在连接")
-                connectGattWithDelay(candidate.device)
+                listener.onStatus("已从已配对设备匹配: ${candidate.displayName}，后台预连接中...")
+                connectAndMaybeSend(candidate.device)
+                return
             }
-
-            override fun onScanFailed(errorCode: Int) {
-                autoScanCallback = null
-                Log.e(TAG, "auto-bind scan failed errorCode=$errorCode")
-                if (triggeredBySend) {
-                    failCurrentSend("扫描失败: $errorCode")
-                } else {
-                    listener.onStatus("后台扫描失败: $errorCode")
-                }
-            }
-        }
-
-        autoScanCallback = callback
-        scanner.startScan(emptyList(), defaultScanSettings(), callback)
-        handler.postDelayed({
-            if (autoScanCallback === callback) {
-                scanner.stopScan(callback)
-                autoScanCallback = null
-                val fallback = connectScanResults.values.firstOrNull()
-                if (fallback != null) {
-                    saveBoundDevice(fallback.address, fallback.displayName)
-                    listener.onStatus("已自动绑定: ${fallback.displayName}，正在连接")
-                    connectGattWithDelay(fallback.device)
-                    return@postDelayed
-                }
-                if (triggeredBySend) {
-                    failCurrentSend("首次自动连接失败，未发现平板")
-                } else {
-                    listener.onStatus("后台未发现可连接平板")
-                }
-            }
-        }, CONNECT_SCAN_TIMEOUT_MS)
-    }
-
-    private fun scanAndConnect(targetAddress: String, targetName: String) {
-        handler.removeCallbacks(directConnectFallbackRunnable)
-        directFallbackAddress = null
-        directFallbackName = null
-        disconnectGatt()
-        val scanner = scanner ?: run {
-            listener.onSendResult(false, "蓝牙扫描不可用")
+            listener.onStatus("未绑定，后台自动发现设备...")
+            startDiscovery(DiscoveryPurpose.AUTO_BIND_WARMUP, "后台扫描中...")
             return
         }
 
-        autoScanCallback?.let { scanner.stopScan(it) }
-
-        connectScanResults.clear()
-        val callback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val device = result.device ?: return
-                if (!isTargetService(result)) return
-
-                val resolvedName = resolveDisplayName(device, result)
-                val candidate = BindCandidate(device, device.address ?: "", resolvedName)
-                if (candidate.address.isNotBlank()) {
-                    connectScanResults[candidate.address] = candidate
-                }
-
-                val addressMatched = device.address.equals(targetAddress, ignoreCase = true)
-                val nameMatched = targetName.isNotBlank() && resolvedName == targetName
-                if (addressMatched || nameMatched) {
-                    scanner.stopScan(this)
-                    autoScanCallback = null
-                    Log.d(TAG, "scan match address=$addressMatched name=$nameMatched addr=${candidate.address} name=${candidate.displayName}")
-                    listener.onStatus("已发现平板，正在连接")
-                    connectGattWithDelay(device)
-                }
-            }
-
-            override fun onScanFailed(errorCode: Int) {
-                autoScanCallback = null
-                Log.e(TAG, "scan failed errorCode=$errorCode")
-                listener.onSendResult(false, "扫描失败: $errorCode")
-            }
-        }
-        autoScanCallback = callback
-
-        // Use broad scan and perform service/match filtering in callback.
-        // This avoids failures on devices that rotate BLE addresses.
-        scanner.startScan(emptyList(), defaultScanSettings(), callback)
-
-        handler.postDelayed({
-            if (autoScanCallback === callback) {
-                scanner.stopScan(callback)
-                autoScanCallback = null
-                val fallback = pickFallbackCandidate(targetAddress, targetName)
-                if (fallback != null) {
-                    Log.w(TAG, "connect scan fallback to addr=${fallback.address} name=${fallback.displayName}")
-                    listener.onStatus("已发现候选平板，正在连接")
-                    connectGattWithDelay(fallback.device)
-                } else {
-                    onAttemptFailed("连接超时，未发现平板")
-                }
-            }
-        }, CONNECT_SCAN_TIMEOUT_MS)
-    }
-
-    private fun connectGattWithDelay(device: BluetoothDevice) {
-        if (isConnecting) return
-        isConnecting = true
-        // Keep scan/connect serialized to reduce OEM stack race that often ends with 133.
-        autoScanCallback?.let { scanner?.stopScan(it) }
-        autoScanCallback = null
-        handler.postDelayed({
-            connectGatt(device)
-        }, PRE_CONNECT_DELAY_MS)
-    }
-
-    private fun connectGatt(device: BluetoothDevice) {
-        Log.d(TAG, "connectGatt addr=${device.address} name=${device.name}")
-        servicesDiscoveryStarted = false
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, false, gattCallback)
-        }
-    }
-
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            Log.d(TAG, "onConnectionStateChange status=$status newState=$newState")
-            if (newState == BluetoothGatt.STATE_CONNECTED) {
-                val prioritySet = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                Log.d(TAG, "requestConnectionPriority(HIGH) result=$prioritySet")
-                listener.onStatus("连接成功，协商链路中")
-                val mtuRequested = gatt.requestMtu(DESIRED_MTU)
-                Log.d(TAG, "requestMtu($DESIRED_MTU) result=$mtuRequested")
-                if (mtuRequested) {
-                    handler.postDelayed(mtuFallbackRunnable, MTU_FALLBACK_TIMEOUT_MS)
-                } else {
-                    maybeDiscoverServices(gatt, "mtu-not-requested")
-                }
-            } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
-                handler.removeCallbacks(mtuFallbackRunnable)
-                if (pendingPayload != null && pendingMsgId != null) {
-                    // unexpected disconnect before ack.
-                    val reason = if (status == GATT_ERROR_133) "连接异常(133)" else "连接断开($status)"
-                    Log.w(TAG, "gatt disconnected before ack status=$status")
-                    onAttemptFailed(reason)
-                }
-            }
-        }
-
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            Log.d(TAG, "onMtuChanged status=$status mtu=$mtu")
-            handler.removeCallbacks(mtuFallbackRunnable)
-            maybeDiscoverServices(gatt, "mtu-changed:$status/$mtu")
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val serviceCount = gatt.services?.size ?: -1
-            Log.d(TAG, "onServicesDiscovered status=$status serviceCount=$serviceCount")
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.w(TAG, "discover services failed status=$status")
-                onAttemptFailed("服务发现失败($status)")
-                return
-            }
-            val service = gatt.getService(BleConstants.SERVICE_UUID)
-            if (service == null) {
-                Log.w(TAG, "service not found")
-                onAttemptFailed("未发现接收服务")
-                return
-            }
-
-            writeCharacteristic = service.getCharacteristic(BleConstants.WRITE_UUID)
-            ackCharacteristic = service.getCharacteristic(BleConstants.ACK_UUID)
-            if (writeCharacteristic == null || ackCharacteristic == null) {
-                Log.w(TAG, "characteristics incomplete")
-                onAttemptFailed("服务特征不完整")
-                return
-            }
-
-            val descriptor = ackCharacteristic?.getDescriptor(BleConstants.CCCD_UUID)
-            if (descriptor == null) {
-                Log.w(TAG, "cccd missing")
-                onAttemptFailed("通知描述符缺失")
-                return
-            }
-
-            val notifyEnabled = gatt.setCharacteristicNotification(ackCharacteristic, true)
-            Log.d(TAG, "setCharacteristicNotification result=$notifyEnabled")
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            val descriptorWriteStarted = gatt.writeDescriptor(descriptor)
-            Log.d(TAG, "writeDescriptor started=$descriptorWriteStarted")
-            if (!descriptorWriteStarted) {
-                onAttemptFailed("启用回执通知失败(start)")
-            }
-        }
-
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt,
-            descriptor: BluetoothGattDescriptor,
-            status: Int,
-        ) {
-            if (descriptor.uuid != BleConstants.CCCD_UUID) return
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.w(TAG, "descriptor write failed status=$status")
-                onAttemptFailed("启用回执通知失败($status)")
-                return
-            }
-            val payload = pendingPayload ?: return
-            sendPayload(gatt, payload)
-        }
-
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int,
-        ) {
-            if (characteristic.uuid != BleConstants.WRITE_UUID) return
-            Log.d(TAG, "onCharacteristicWrite status=$status")
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.w(TAG, "write characteristic failed status=$status")
-                onAttemptFailed("发送失败($status)")
-            }
-        }
-
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-        ) {
-            if (characteristic.uuid != BleConstants.ACK_UUID) return
-            val ack = JsonCodec.decodeAck(characteristic.value) ?: return
-            Log.d(TAG, "onCharacteristicChanged legacy ackId=${ack.msgId.takeLast(6)} ok=${ack.ok}")
-            handleAck(ack.msgId, ack.ok)
-        }
-
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-        ) {
-            if (characteristic.uuid != BleConstants.ACK_UUID) return
-            val ack = JsonCodec.decodeAck(value) ?: return
-            Log.d(TAG, "onCharacteristicChanged v33 ackId=${ack.msgId.takeLast(6)} ok=${ack.ok}")
-            handleAck(ack.msgId, ack.ok)
-        }
-    }
-
-    private val ackTimeoutRunnable = Runnable {
-        onAttemptFailed("等待回执超时")
-    }
-
-    private fun onAttemptFailed(reason: String) {
-        disconnectGatt()
-        if (retriesLeft > 0 && pendingPayload != null) {
-            retriesLeft -= 1
-            currentAttempt += 1
-            Log.w(TAG, "attempt failed reason=$reason retriesLeft=$retriesLeft")
-            listener.onStatus("$reason，正在重试(${MAX_RETRY - retriesLeft}/$MAX_RETRY)")
-            val bound = getBoundAddress()
-            if (bound.isBlank()) {
-                listener.onSendResult(false, "设备丢失绑定")
-                return
-            }
-            val delay = computeRetryDelay(reason, currentAttempt)
-            handler.postDelayed(
-                {
-                    connectWithFallback(bound, getBoundName(), preferDirect = false)
-                },
-                delay,
-            )
-            return
-        }
-
-        pendingPayload = null
-        pendingMsgId = null
-        Log.e(TAG, "send failed final reason=$reason")
-        listener.onSendResult(false, "$reason，发送失败")
-    }
-
-    private fun failCurrentSend(message: String) {
-        pendingPayload = null
-        pendingMsgId = null
-        handler.removeCallbacks(ackTimeoutRunnable)
-        disconnectGatt()
-        listener.onSendResult(false, message)
+        listener.onStatus("后台预连接中...")
+        connectToBoundAddress(boundAddress)
     }
 
     fun release() {
-        stopBindScan()
-        autoScanCallback?.let { scanner?.stopScan(it) }
-        autoScanCallback = null
-        disconnectGatt()
+        awaitingUserSelection = false
+        stopDiscoveryInternal(emitStatus = false)
         handler.removeCallbacksAndMessages(null)
+        disconnectSocket()
+        unregisterReceiverIfNeeded()
     }
 
-    private fun disconnectGatt() {
-        handler.removeCallbacks(idleDisconnectRunnable)
+    private fun connectToBoundAddress(address: String) {
+        val device = try {
+            adapter?.getRemoteDevice(address)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+        if (device == null) {
+            onAttemptFailed("绑定设备不可用")
+            return
+        }
+        connectAndMaybeSend(device)
+    }
+
+    private fun connectAndMaybeSend(device: BluetoothDevice) {
+        if (isConnecting) return
+        isConnecting = true
+        stopDiscoveryInternal(emitStatus = false)
+
+        Thread {
+            try {
+                adapter?.cancelDiscovery()
+                val newSocket = connectSocketWithFallback(device)
+                synchronized(ioLock) {
+                    socket = newSocket
+                    reader = BufferedReader(InputStreamReader(newSocket.inputStream, Charsets.UTF_8))
+                    writer = BufferedWriter(OutputStreamWriter(newSocket.outputStream, Charsets.UTF_8))
+                }
+                startReadLoop()
+                handler.post {
+                    isConnecting = false
+                    listener.onStatus("连接成功")
+                    if (!trySendOnExistingConnection()) {
+                        scheduleIdleDisconnect()
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "connect failed", t)
+                disconnectSocket()
+                handler.post {
+                    isConnecting = false
+                    if (pendingPayload != null) {
+                        onAttemptFailed("连接失败")
+                    } else {
+                        listener.onStatus("预连接失败")
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun connectSocketWithFallback(device: BluetoothDevice): BluetoothSocket {
+        val builders = mutableListOf<() -> BluetoothSocket>()
+        builders += { device.createRfcommSocketToServiceRecord(BleConstants.SERVICE_UUID) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.GINGERBREAD_MR1) {
+            builders += { device.createInsecureRfcommSocketToServiceRecord(BleConstants.SERVICE_UUID) }
+        }
+        builders += {
+            val method = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+            method.invoke(device, 1) as BluetoothSocket
+        }
+
+        var lastError: Throwable? = null
+        builders.forEachIndexed { index, create ->
+            handler.post { listener.onStatus("连接尝试 ${index + 1}/${builders.size}...") }
+            val socket = runCatching { create() }.getOrElse { error ->
+                lastError = error
+                return@forEachIndexed
+            }
+            try {
+                socket.connect()
+                Log.i(TAG, "socket connect success strategy=$index")
+                return socket
+            } catch (t: Throwable) {
+                lastError = t
+                Log.w(TAG, "socket connect failed strategy=$index", t)
+                runCatching { socket.close() }
+            }
+        }
+        throw IOException("All RFCOMM strategies failed", lastError)
+    }
+
+    private fun startReadLoop() {
+        readThread?.interrupt()
+        readThread = Thread {
+            try {
+                while (!Thread.currentThread().isInterrupted) {
+                    val localReader = synchronized(ioLock) { reader } ?: break
+                    val line = localReader.readLine() ?: break
+                    val ack = JsonCodec.decodeAck(line.toByteArray(Charsets.UTF_8)) ?: continue
+                    handler.post { handleAck(ack.msgId, ack.ok) }
+                }
+            } catch (_: Throwable) {
+                // ignore and let reconnection handle next send
+            }
+        }.also { it.start() }
+    }
+
+    private fun trySendOnExistingConnection(): Boolean {
+        val payload = pendingPayload ?: return false
+        if (!isSocketAlive()) return false
+        return sendPayload(payload)
+    }
+
+    private fun sendPayload(payload: ByteArray): Boolean {
+        return try {
+            val localWriter = synchronized(ioLock) { writer } ?: return false
+            localWriter.write(String(payload, Charsets.UTF_8))
+            localWriter.newLine()
+            localWriter.flush()
+            listener.onStatus("发送中...")
+            handler.removeCallbacks(ackTimeoutRunnable)
+            handler.postDelayed(ackTimeoutRunnable, ACK_TIMEOUT_MS)
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "send payload failed", t)
+            onAttemptFailed("发包失败")
+            false
+        }
+    }
+
+    private fun handleAck(msgId: String, ok: Boolean) {
+        val expected = pendingMsgId ?: return
+        if (!ok || msgId != expected) return
         handler.removeCallbacks(ackTimeoutRunnable)
-        handler.removeCallbacks(mtuFallbackRunnable)
-        handler.removeCallbacks(directConnectFallbackRunnable)
-        isConnecting = false
-        servicesDiscoveryStarted = false
+        val sentId = pendingMsgId
+        pendingPayload = null
+        pendingMsgId = null
+        listener.onStatus("发送成功")
+        listener.onSendResult(true, "已送达")
+        AppState.setStatus("最近发送成功: ${sentId?.takeLast(6)}")
+        scheduleIdleDisconnect()
+    }
+
+    private fun onAttemptFailed(reason: String) {
+        handler.removeCallbacks(ackTimeoutRunnable)
+        disconnectSocket()
+        if (reason.contains("连接失败") || reason.contains("绑定设备不可用")) {
+            clearBoundDevice()
+        }
+        if (retriesLeft > 0 && pendingPayload != null) {
+            retriesLeft -= 1
+            currentAttempt += 1
+            listener.onStatus("$reason，正在重试(${MAX_RETRY - retriesLeft}/$MAX_RETRY)")
+            val delay = computeRetryDelay(reason, currentAttempt)
+            handler.postDelayed({
+                val bound = getBoundAddress()
+                if (bound.isBlank()) {
+                    startDiscovery(DiscoveryPurpose.AUTO_BIND_AND_SEND, "重试中，扫描设备...")
+                } else {
+                    connectToBoundAddress(bound)
+                }
+            }, delay)
+            return
+        }
+        failCurrentSend("$reason，发送失败")
+    }
+
+    private fun failCurrentSend(message: String) {
+        handler.removeCallbacks(ackTimeoutRunnable)
+        pendingPayload = null
+        pendingMsgId = null
+        disconnectSocket()
+        listener.onSendResult(false, message)
+    }
+
+    private fun startDiscovery(purpose: DiscoveryPurpose, status: String) {
+        if (adapter?.isEnabled != true) {
+            if (purpose == DiscoveryPurpose.AUTO_BIND_AND_SEND) {
+                failCurrentSend("请先开启蓝牙")
+            } else {
+                listener.onStatus("请先开启蓝牙")
+            }
+            return
+        }
+
+        registerReceiverIfNeeded()
+        stopDiscoveryInternal(emitStatus = false)
+
+        bindScanResults.clear()
+        awaitingUserSelection = false
+        discoveryPurpose = purpose
+        isDiscoveryRunning = true
+        listener.onStatus(status)
+        val started = adapter?.startDiscovery() == true
+        if (!started) {
+            isDiscoveryRunning = false
+            discoveryPurpose = DiscoveryPurpose.NONE
+            if (purpose == DiscoveryPurpose.AUTO_BIND_AND_SEND) {
+                failCurrentSend("扫描启动失败")
+            } else {
+                listener.onStatus("扫描启动失败")
+            }
+            return
+        }
+        handler.removeCallbacks(discoveryTimeoutRunnable)
+        handler.postDelayed(discoveryTimeoutRunnable, DISCOVERY_TIMEOUT_MS)
+    }
+
+    private fun stopDiscoveryInternal(emitStatus: Boolean) {
+        if (adapter?.isDiscovering == true) {
+            adapter.cancelDiscovery()
+        }
+        handler.removeCallbacks(discoveryTimeoutRunnable)
+        if (isDiscoveryRunning && emitStatus) {
+            listener.onStatus("扫描结束")
+        }
+        isDiscoveryRunning = false
+    }
+
+    private fun handleDiscoveryCompleted() {
+        val purpose = discoveryPurpose
+        discoveryPurpose = DiscoveryPurpose.NONE
+        val candidates = bindScanResults.values.toList()
+        val taggedCandidates = candidates.filter { isLikelyReceiverDevice(it.displayName) }
+
+        if (purpose == DiscoveryPurpose.NONE) {
+            listener.onStatus("扫描结束")
+            return
+        }
+
+        if (candidates.isEmpty()) {
+            when (purpose) {
+                DiscoveryPurpose.AUTO_BIND_AND_SEND -> failCurrentSend("首次自动连接失败，未发现平板（请确认学生端在接收模式）")
+                DiscoveryPurpose.AUTO_BIND_WARMUP -> listener.onStatus("后台未发现可连接平板（学生端需在接收模式）")
+                DiscoveryPurpose.NONE -> listener.onStatus("扫描结束")
+            }
+            return
+        }
+
+        if (taggedCandidates.size == 1) {
+            val only = taggedCandidates.first()
+            saveBoundDevice(only.address, only.displayName)
+            listener.onStatus("已自动绑定: ${only.displayName}，正在连接")
+            connectAndMaybeSend(only.device)
+            return
+        }
+
+        if (taggedCandidates.size > 1) {
+            if (purpose == DiscoveryPurpose.AUTO_BIND_WARMUP) {
+                val pick = taggedCandidates.first()
+                saveBoundDevice(pick.address, pick.displayName)
+                listener.onStatus("后台自动选择: ${pick.displayName}")
+                connectAndMaybeSend(pick.device)
+                return
+            }
+            awaitingUserSelection = true
+            listener.onStatus("发现多个学生平板，请选择设备")
+            listener.onNeedSelectDevice(taggedCandidates)
+            return
+        }
+
+        val namedCandidates = candidates.filter { it.displayName != UNKNOWN_NAME }
+        if (namedCandidates.isNotEmpty()) {
+            if (purpose == DiscoveryPurpose.AUTO_BIND_WARMUP) {
+                listener.onStatus("后台扫描未命中特殊标识")
+                return
+            }
+            awaitingUserSelection = true
+            listener.onStatus("未发现标识设备，请手动选择学生平板")
+            listener.onNeedSelectDevice(namedCandidates)
+            return
+        }
+
+        when (purpose) {
+            DiscoveryPurpose.AUTO_BIND_AND_SEND -> failCurrentSend("首次自动连接失败，未识别到可用设备")
+            DiscoveryPurpose.AUTO_BIND_WARMUP -> listener.onStatus("后台未识别到可用设备")
+            DiscoveryPurpose.NONE -> listener.onStatus("扫描结束")
+        }
+    }
+
+    private fun scheduleIdleDisconnect() {
+        handler.removeCallbacks(idleDisconnectRunnable)
+        handler.postDelayed(idleDisconnectRunnable, IDLE_DISCONNECT_MS)
+    }
+
+    private fun disconnectSocket() {
+        handler.removeCallbacks(idleDisconnectRunnable)
+        readThread?.interrupt()
+        readThread = null
         try {
-            gatt?.disconnect()
-            gatt?.close()
+            synchronized(ioLock) {
+                reader?.close()
+                writer?.close()
+                socket?.close()
+                reader = null
+                writer = null
+                socket = null
+            }
         } catch (_: Throwable) {
             // ignore
         }
-        gatt = null
-        ackCharacteristic = null
-        writeCharacteristic = null
     }
 
-    private fun defaultScanSettings(): ScanSettings {
-        return ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
+    private fun isSocketAlive(): Boolean {
+        val s = socket ?: return false
+        return s.isConnected && reader != null && writer != null
+    }
+
+    private fun registerReceiverIfNeeded() {
+        if (receiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+        context.registerReceiver(discoveryReceiver, filter)
+        receiverRegistered = true
+    }
+
+    private fun unregisterReceiverIfNeeded() {
+        if (!receiverRegistered) return
+        runCatching { context.unregisterReceiver(discoveryReceiver) }
+        receiverRegistered = false
     }
 
     private fun checkPermissions(): Boolean {
@@ -604,6 +586,12 @@ class SenderBleManager(
 
     private fun getBoundName(): String = prefs.getString(BleConstants.KEY_BOUND_DEVICE_NAME, "") ?: ""
 
+    private fun isBoundTargetLikelyReceiver(): Boolean {
+        val name = getBoundName().trim()
+        if (name.isBlank()) return false
+        return isLikelyReceiverDevice(name)
+    }
+
     private fun saveBoundDevice(address: String?, displayName: String?) {
         if (address.isNullOrBlank()) return
         prefs.edit()
@@ -612,79 +600,30 @@ class SenderBleManager(
             .apply()
     }
 
-    private fun isTargetService(result: ScanResult): Boolean {
-        val uuids = result.scanRecord?.serviceUuids ?: return false
-        return uuids.any { it.uuid == BleConstants.SERVICE_UUID }
-    }
-
-    private fun resolveDisplayName(device: BluetoothDevice, result: ScanResult): String {
-        val fromRecord = result.scanRecord?.deviceName?.trim().orEmpty()
-        if (fromRecord.isNotEmpty()) return fromRecord
-        val fromDevice = device.name?.trim().orEmpty()
-        if (fromDevice.isNotEmpty()) return fromDevice
-        return UNKNOWN_NAME
-    }
-
-    private fun handleAck(msgId: String, ok: Boolean) {
-        if (msgId != pendingMsgId || !ok) return
-        Log.i(TAG, "ack matched msgId=${msgId.takeLast(6)}")
-        handler.removeCallbacks(ackTimeoutRunnable)
-        val sentId = pendingMsgId
-        pendingMsgId = null
-        pendingPayload = null
-        val g = gatt
-        if (g != null) {
-            val lowered = g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
-            Log.d(TAG, "requestConnectionPriority(BALANCED) result=$lowered")
-        }
-        handler.removeCallbacks(idleDisconnectRunnable)
-        handler.postDelayed(idleDisconnectRunnable, IDLE_DISCONNECT_MS)
-        listener.onStatus("发送成功")
-        listener.onSendResult(true, "已送达")
-        AppState.setStatus("最近发送成功: ${sentId?.takeLast(6)}")
-    }
-
-    private fun sendPayload(gatt: BluetoothGatt, payload: ByteArray): Boolean {
-        val characteristic = writeCharacteristic ?: return false
-        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = payload
-        listener.onStatus("发送中...")
-        Log.d(TAG, "writeCharacteristic start writeType=${characteristic.writeType} payloadBytes=${payload.size}")
-        val started = gatt.writeCharacteristic(characteristic)
-        if (!started) {
-            onAttemptFailed("发包失败")
-            return false
-        }
-        handler.removeCallbacks(ackTimeoutRunnable)
-        handler.postDelayed(ackTimeoutRunnable, ACK_TIMEOUT_MS)
-        return true
-    }
-
-    private fun maybeDiscoverServices(gatt: BluetoothGatt, source: String) {
-        if (servicesDiscoveryStarted) {
-            Log.d(TAG, "discoverServices skipped source=$source")
-            return
-        }
-        servicesDiscoveryStarted = true
-        listener.onStatus("发现服务中...")
-        val started = gatt.discoverServices()
-        Log.d(TAG, "discoverServices source=$source started=$started")
-        if (!started) {
-            onAttemptFailed("服务发现启动失败")
+    private fun collectBondedCandidates(): List<BindCandidate> {
+        val paired = adapter?.bondedDevices.orEmpty()
+        return paired.mapNotNull { device ->
+            val address = device.address ?: return@mapNotNull null
+            val name = resolveDisplayName(device)
+            BindCandidate(device, address, name)
         }
     }
 
-    private fun pickFallbackCandidate(targetAddress: String, targetName: String): BindCandidate? {
-        if (connectScanResults.isEmpty()) return null
-        connectScanResults[targetAddress]?.let { return it }
-        if (targetName.isNotBlank()) {
-            connectScanResults.values.firstOrNull { it.displayName == targetName }?.let { return it }
+    private fun resolveDisplayName(device: BluetoothDevice): String {
+        val name = try {
+            device.name?.trim().orEmpty()
+        } catch (_: SecurityException) {
+            ""
         }
-        return if (connectScanResults.size == 1) connectScanResults.values.first() else null
+        return if (name.isNotBlank()) name else UNKNOWN_NAME
+    }
+
+    private fun isLikelyReceiverDevice(name: String): Boolean {
+        return name.startsWith(BleConstants.RECEIVER_NAME_PREFIX)
     }
 
     private fun computeRetryDelay(reason: String, attempt: Int): Long {
-        if (reason.contains("(133)")) {
+        if (reason.contains("133")) {
             return when (attempt) {
                 1 -> 900L
                 2 -> 1_800L
@@ -696,17 +635,11 @@ class SenderBleManager(
 
     companion object {
         private const val TAG = "SenderBleManager"
-        private const val GATT_ERROR_133 = 133
-        private const val DESIRED_MTU = 247
-        private const val MTU_FALLBACK_TIMEOUT_MS = 1_000L
-        private const val DIRECT_CONNECT_FALLBACK_MS = 1_500L
-        private const val IDLE_DISCONNECT_MS = 15_000L
         private const val UNKNOWN_NAME = "未知设备"
-        private const val BIND_SCAN_TIMEOUT_MS = 4_000L
-        private const val CONNECT_SCAN_TIMEOUT_MS = 3_000L
-        private const val PRE_CONNECT_DELAY_MS = 120L
+        private const val DISCOVERY_TIMEOUT_MS = 4_000L
         private const val ACK_TIMEOUT_MS = 1_500L
         private const val RETRY_DELAY_MS = 500L
         private const val MAX_RETRY = 2
+        private const val IDLE_DISCONNECT_MS = 15_000L
     }
 }

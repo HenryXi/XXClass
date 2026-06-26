@@ -6,8 +6,10 @@ object BleConstants {
     const val PREFS = "ble_prefs"
     const val KEY_BOUND_DEVICE = "bound_device"
     const val KEY_BOUND_DEVICE_NAME = "bound_device_name"
+    const val KEY_LAST_SENDER_DEVICE = "last_sender_device"
     const val MAX_TEXT_LEN = 16
     const val SERVICE_NAME = "ClassroomText"
+    const val RECEIVER_NAME_PREFIX = "ClassroomText-RX"
 
     val SERVICE_UUID: UUID = UUID.fromString("e12f5f22-6f4f-4b2f-8266-8e0d3ac9f901")
     val WRITE_UUID: UUID = UUID.fromString("e12f5f22-6f4f-4b2f-8266-8e0d3ac9f902")
